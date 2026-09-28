@@ -7,13 +7,13 @@ concurrency test meaningful: each request must get back exactly the ID it sent.
 
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import date
 
 import cv2
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
-from httpx import Response
 
 from khmer_kyc_ocr.api import create_app
 from khmer_kyc_ocr.config import Settings
@@ -97,28 +97,37 @@ class TestAuth:
         assert client.get("/healthz").status_code == 200
 
 
+@dataclass(frozen=True)
+class Reply:
+    """Plain status + body, so tests don't depend on the test client's Response class
+    (Starlette's TestClient returns httpx.Response or httpx2.Response depending on install)."""
+
+    status_code: int
+    text: str
+
+
 def _post(
     client: TestClient, data: bytes, *, token: str = TOKEN, content_type: str = "image/jpeg"
-) -> Response:
+) -> Reply:
     # Raw image body, not multipart: multipart spools uploads over 1 MB to a temp file on disk.
-    response: Response = client.post(
+    r = client.post(
         "/v1/id-card",
         content=data,
         headers={"X-API-Token": token, "Content-Type": content_type},
     )
-    return response
+    return Reply(status_code=r.status_code, text=r.text)
 
 
 def read_ok(client: TestClient, data: bytes) -> IdCardResult:
     r = _post(client, data)
     assert r.status_code == 200, r.text
-    return IdCardResult.model_validate(r.json())
+    return IdCardResult.model_validate_json(r.text)
 
 
 def read_rejected(client: TestClient, data: bytes) -> str:
     r = _post(client, data)
     assert r.status_code == 422, r.text
-    return RejectedImage.model_validate(r.json()).reason
+    return RejectedImage.model_validate_json(r.text).reason
 
 
 def values(result: IdCardResult) -> dict[str, str | None]:
