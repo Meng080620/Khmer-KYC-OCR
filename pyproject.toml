@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "khmer-kyc-ocr"
+version = "0.1.0"
+description = "Offline, on-prem OCR for Cambodian national ID cards"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+]
+
+[project.optional-dependencies]
+# Kept optional so the pipeline, parser and API are testable without torch installed.
+# kiri-ocr itself is installed with --no-deps (see Dockerfile/README): its declared deps pull
+# onnxruntime-gpu (no macOS build), datasets, matplotlib and non-headless OpenCV, none of which
+# recognition needs. These are what its recognition path (core.py, model.py) imports.
+kiri = ["torch>=2.2", "Pillow>=10", "safetensors>=0.4", "huggingface_hub>=0.23"]
+dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.5", "mypy>=1.10"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+khmer_kyc_ocr = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+# Khmer strings legitimately contain characters ruff flags as ambiguous.
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+mypy_path = "src"
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["cv2.*", "kiri_ocr.*"]
+ignore_missing_imports = true
