@@ -7,12 +7,11 @@ Real-card accuracy is measured by spike/bench.py, not here.
 
 import time
 from datetime import date
+from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
-from PIL import Image as PILImage
-from PIL import ImageDraw, ImageFont
 
 from khmer_kyc_ocr.config import Settings
 from khmer_kyc_ocr.pipeline.template import TEMPLATE_V1
@@ -22,7 +21,12 @@ from khmer_kyc_ocr.service import IdCardReader
 from tests.synthetic import photograph
 
 pytest.importorskip("kiri_ocr")
-FONT_PATH = "/System/Library/Fonts/Supplemental/Arial.ttf"
+# First existing font wins: macOS dev machines, then Ubuntu (GitHub Actions runners).
+FONT_PATHS = (
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+)
 
 TEXT: dict[FieldName, str] = {
     "id_number": "010845612",
@@ -45,10 +49,15 @@ def reader() -> IdCardReader:
 
 
 def render_card() -> bytes:
-    try:
-        font = ImageFont.truetype(FONT_PATH, 34)
-    except OSError:
-        pytest.skip("font not available")
+    # Imported here, not at module top: CI installs only the dev extras (no Pillow, no kiri),
+    # and the module-level importorskip must run before anything that needs them.
+    from PIL import Image as PILImage
+    from PIL import ImageDraw, ImageFont
+
+    font_path = next((p for p in FONT_PATHS if Path(p).exists()), None)
+    if font_path is None:
+        pytest.skip("no Latin TrueType font available")
+    font = ImageFont.truetype(font_path, 34)
     card = PILImage.new("RGB", (CARD_W, CARD_H), (236, 236, 230))
     draw = ImageDraw.Draw(card)
     for name, text in TEXT.items():

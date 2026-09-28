@@ -84,6 +84,44 @@ The tests need neither torch nor real IDs:
 - The recognizer is a fake that reads a code painted into each field box.
 - `test_concurrent_requests_never_mix_results` checks that parallel requests each get back only their own ID.
 
+## Calibrate on real cards (required before launch)
+
+Use real front-of-card photos you have consent to use, taken the way users will take them: whole card in frame, darker plain background. They go in `spike/samples/`, which git ignores.
+
+**1. Add photos, then write the answer sheet.** This lists every photo in `labels.csv` with empty columns:
+
+```bash
+mkdir -p spike/samples
+```
+
+```bash
+.venv/bin/python spike/bench.py --init spike/samples/
+```
+
+**2. Fill in `labels.csv`** in the format the API returns:
+- ID number: 9 digits
+- names as printed, Latin name in uppercase
+- dates as `YYYY-MM-DD`
+- sex as `M` or `F`
+
+**3. Tune the field boxes.** Run this on one card:
+
+```bash
+.venv/bin/python spike/calibrate.py spike/samples/card01.jpg /tmp/roi.png
+```
+
+Adjust `pipeline/template.py` until each red box covers its field on several cards. Then remove `-uncalibrated` from `TEMPLATE_VERSION`.
+
+**4. Run the go/no-go benchmark:**
+
+```bash
+HF_HOME=.hf-cache .venv/bin/python spike/bench.py spike/samples/
+```
+
+- It passes if the ID number is exactly right on at least 95% of cards and p95 latency is under 1.5s.
+- Set `KYC_OCR_MIN_CONFIDENCE` just above the `wrong: p90` confidence it prints.
+- About 30 cards is the minimum for these numbers to mean anything.
+
 ## Handling personal data
 
 - Images are decoded in memory and never written to disk.

@@ -1,6 +1,7 @@
 """Go/no-go benchmark on REAL ID photos, end to end through the same IdCardReader the API uses.
 
-    python spike/bench.py spike/samples/            # expects spike/samples/labels.csv
+    python spike/bench.py --init spike/samples/     # write a labels.csv template for the photos
+    python spike/bench.py spike/samples/            # run the benchmark
 
 labels.csv columns: file,id_number,name_khmer,name_latin,date_of_birth,sex,expiry_date
 (values in the normalised form the API returns: ISO dates, M/F, uppercase Latin name).
@@ -27,6 +28,30 @@ from khmer_kyc_ocr.service import PARSERS, IdCardReader
 GATE_ID_EXACT = 0.95
 GATE_P95_MS = 1500.0
 FIELDS: list[FieldName] = list(PARSERS)
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def find_photos(sample_dir: Path) -> list[Path]:
+    return sorted(p for p in sample_dir.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
+
+
+def init_labels(sample_dir: Path) -> int:
+    """Write labels.csv with one row per photo and empty answer columns to fill in by hand."""
+    labels = sample_dir / "labels.csv"
+    if labels.exists():
+        print(f"{labels} already exists; not overwriting your answers")
+        return 1
+    photos = find_photos(sample_dir)
+    if not photos:
+        print(f"no photos in {sample_dir}: add front-of-card .jpg/.png/.webp files first")
+        return 1
+    with labels.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["file", *FIELDS])
+        writer.writerows([p.name, *([""] * len(FIELDS))] for p in photos)
+    print(f"wrote {labels} with {len(photos)} rows. Fill each row in the API's format:")
+    print("  id_number 9 digits | names as printed (Latin UPPERCASE) | dates YYYY-MM-DD | sex M/F")
+    return 0
 
 
 def levenshtein(a: str, b: str) -> int:
@@ -40,10 +65,16 @@ def levenshtein(a: str, b: str) -> int:
 
 
 def main(sample_dir: Path) -> int:
-    with (sample_dir / "labels.csv").open(encoding="utf-8") as f:
+    labels = sample_dir / "labels.csv"
+    if not labels.exists():
+        print(f"missing {labels}. Add card photos, then run:")
+        print(f"  python spike/bench.py --init {sample_dir}")
+        return 1
+    with labels.open(encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    if not rows:
-        print("labels.csv is empty")
+    unfilled = [r["file"] for r in rows if not r.get("id_number", "").strip()]
+    if not rows or unfilled:
+        print(f"labels.csv has {len(rows)} rows, {len(unfilled)} without answers: fill them first")
         return 1
 
     # The token is irrelevant offline; the reader is called directly, not over HTTP.
@@ -103,7 +134,10 @@ def main(sample_dir: Path) -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    if args[:1] == ["--init"] and len(args) == 2:
+        sys.exit(init_labels(Path(args[1])))
+    if len(args) != 1 or args[0].startswith("-"):
         print(__doc__)
         sys.exit(2)
-    sys.exit(main(Path(sys.argv[1])))
+    sys.exit(main(Path(args[0])))
