@@ -48,3 +48,28 @@ jobs:
 
       - name: Tests (includes the real-model integration test)
         run: pytest -rs
+
+  docker:
+    # Proves the Dockerfile's promise: the image builds with weights baked in and the
+    # service starts and loads the model with NO network at all (--network none).
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t khmer-kyc-ocr .
+
+      - name: Start offline and wait for the model to load
+        run: |
+          docker run -d --name ocr --network none -e KYC_OCR_API_TOKEN=ci-token -e WORKERS=1 khmer-kyc-ocr
+          for i in $(seq 1 60); do
+            status=$(docker exec ocr python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz'))['status'])" 2>/dev/null || true)
+            if [ "$status" = "ok" ]; then echo "healthy offline after ~$((i * 2))s"; exit 0; fi
+            sleep 2
+          done
+          echo "service never became healthy"; docker logs ocr; exit 1
+
+      - name: Image size
+        if: always()
+        run: docker image ls khmer-kyc-ocr --format '{{.Repository}} {{.Size}}'
