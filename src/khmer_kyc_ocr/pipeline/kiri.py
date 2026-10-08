@@ -43,6 +43,9 @@ def fetch_model(repo: str = MODEL_REPO, revision: str = MODEL_REVISION) -> Path:
 
 
 class KiriRecognizer:
+    # Exposed so the OCR provider can record the pinned weights on every result.
+    model_revision: str | None = MODEL_REVISION
+
     def __init__(self, model_path: Path | None = None, device: str = "cpu") -> None:
         path = model_path or fetch_model()
         # "accurate" = beam search: slower than greedy CTC, better on stacked Khmer subscripts.

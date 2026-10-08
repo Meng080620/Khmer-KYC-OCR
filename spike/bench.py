@@ -22,12 +22,22 @@ from pathlib import Path
 
 from khmer_kyc_ocr.config import Settings
 from khmer_kyc_ocr.pipeline.kiri import KiriRecognizer
-from khmer_kyc_ocr.schemas import FieldName, IdCardResult
-from khmer_kyc_ocr.service import PARSERS, IdCardReader
+from khmer_kyc_ocr.pipeline.ocr import LocalOCRProvider
+from khmer_kyc_ocr.schemas import FieldName, KYCResult
+from khmer_kyc_ocr.service import KYCPipeline
 
 GATE_ID_EXACT = 0.95
 GATE_P95_MS = 1500.0
-FIELDS: list[FieldName] = list(PARSERS)
+# Fields with a well-defined answer key. Free-text fields (address, place_of_birth) are
+# measured by CER, not exact match.
+FIELDS: list[FieldName] = [
+    "id_number",
+    "name_kh",
+    "name_en",
+    "date_of_birth",
+    "gender",
+    "expiry_date",
+]
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 
@@ -78,7 +88,9 @@ def main(sample_dir: Path) -> int:
         return 1
 
     # The token is irrelevant offline; the reader is called directly, not over HTTP.
-    reader = IdCardReader(KiriRecognizer(), Settings.model_validate({"api_token": "bench"}))
+    recognizer = KiriRecognizer()
+    provider = LocalOCRProvider(recognizer, model_revision=recognizer.model_revision)
+    reader = KYCPipeline(provider, Settings.model_validate({"api_token": "bench"}))
     latencies: list[float] = []
     exact = dict.fromkeys(FIELDS, 0)
     edits = dict.fromkeys(FIELDS, 0)
@@ -92,17 +104,20 @@ def main(sample_dir: Path) -> int:
         started = time.perf_counter()
         result = reader.read(data)
         latencies.append((time.perf_counter() - started) * 1000)
-        if not isinstance(result, IdCardResult):
+        if not isinstance(result, KYCResult):
             rejected[result.reason] = rejected.get(result.reason, 0) + 1
             for name in FIELDS:  # a rejection counts as every character wrong
                 edits[name] += len(row[name])
                 chars[name] += len(row[name])
             continue
         for name in FIELDS:
-            got = result.fields[name].value or ""
-            (conf_right if got == row[name] else conf_wrong).append(result.fields[name].confidence)
+            field = result.fields.get(name)
+            got = field.value if field else None
+            (conf_right if got == row[name] else conf_wrong).append(
+                field.confidence if field else 0.0
+            )
             exact[name] += got == row[name]
-            edits[name] += levenshtein(got, row[name])
+            edits[name] += levenshtein(got or "", row[name])
             chars[name] += len(row[name])
 
     n = len(rows)

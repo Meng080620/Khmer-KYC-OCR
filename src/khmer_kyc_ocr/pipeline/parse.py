@@ -15,7 +15,6 @@ _DIGIT_LOOKALIKES = str.maketrans(
 )
 
 # Cambodian national ID numbers are 9 digits on the cards we have seen.
-# TODO(spike): confirm against the real sample set before production; a new card series may differ.
 ID_NUMBER_RE = re.compile(r"^\d{9}$")
 _KHMER_BLOCK = "ក-៿᧠-᧿"
 _KHMER_NAME_RE = re.compile(rf"^[{_KHMER_BLOCK}]+( [{_KHMER_BLOCK}]+)*$")
@@ -51,8 +50,6 @@ def _collapse_spaces(text: str) -> str:
 
 def parse_id_number(raw: str) -> Parsed:
     text = khmer_to_arabic_digits(_strip_label(raw)).translate(_DIGIT_LOOKALIKES)
-    # After look-alike mapping, anything non-digit is noise (separators, card-edge artifacts).
-    # The strict length check below still rejects reads that lost or gained a digit.
     digits = re.sub(r"\D", "", text)
     return Parsed(digits, True) if ID_NUMBER_RE.fullmatch(digits) else _INVALID
 
@@ -90,3 +87,59 @@ def parse_name_latin(raw: str) -> Parsed:
 def parse_name_khmer(raw: str) -> Parsed:
     name = _collapse_spaces(_strip_label(raw))
     return Parsed(name, True) if _KHMER_NAME_RE.fullmatch(name) else _INVALID
+
+
+def parse_issue(raw: str) -> Parsed:
+    """The validity line prints "from <date> until <date>"; issue is the first date on it."""
+    matches = _DATE_RE.findall(khmer_to_arabic_digits(raw))
+    return _INVALID if not matches else _to_iso(*(int(g) for g in matches[0]))
+
+
+# ---------------------------------------------------------------------------
+# Free-text and enumerated fields (document type, nationality, address, ...)
+# ---------------------------------------------------------------------------
+
+_DOCUMENT_TYPES = {
+    "national_id": (
+        "អត្តសញ្ញាណប័ណ្ណ",
+        "អត្តសញ្ញាណប័ណ្ណសញ្ជាតិខ្មែរ",
+        "អត្តសញ្ញាណប័ណ្ណខ្មែរ",
+        "national identity card",
+        "national id",
+        "identity card",
+    ),
+    "passport": ("លិខិតឆ្លងដែន", "passport"),
+}
+_NATIONALITIES = {
+    "Khmer": ("ខ្មែរ", "khmer"),
+    "Cambodian": ("cambodian", "cambodia"),
+}
+# A free-text value must contain letters in some script and stay under a sane length.
+_TEXT_RE = re.compile(r"[\u1780-\u17ffA-Za-z]", re.UNICODE)
+_MAX_TEXT_LEN = 120
+
+
+def parse_document_type(raw: str) -> Parsed:
+    # The document type is a title/header line, not a "label: value" line, so do NOT
+    # strip after a colon here (that would discard the value).
+    text = _collapse_spaces(raw).lower()
+    for value, labels in _DOCUMENT_TYPES.items():
+        if any(label in text for label in labels):
+            return Parsed(value, True)
+    return _INVALID
+
+
+def parse_nationality(raw: str) -> Parsed:
+    text = _collapse_spaces(_strip_label(raw)).lower()
+    for value, labels in _NATIONALITIES.items():
+        if any(label in text for label in labels):
+            return Parsed(value, True)
+    return _INVALID
+
+
+def parse_free_text(raw: str) -> Parsed:
+    """Address / place of birth: keep any line that has letters, cleaned of the label."""
+    text = _collapse_spaces(_strip_label(raw))
+    if text and _TEXT_RE.search(text) and len(text) <= _MAX_TEXT_LEN:
+        return Parsed(text, True)
+    return _INVALID

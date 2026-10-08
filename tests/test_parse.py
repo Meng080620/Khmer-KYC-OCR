@@ -5,10 +5,14 @@ import pytest
 from khmer_kyc_ocr.pipeline.parse import (
     khmer_to_arabic_digits,
     parse_date,
+    parse_document_type,
     parse_expiry,
+    parse_free_text,
     parse_id_number,
+    parse_issue,
     parse_name_khmer,
     parse_name_latin,
+    parse_nationality,
     parse_sex,
 )
 
@@ -105,3 +109,63 @@ class TestNames:
 
     def test_khmer_name_rejects_latin_only(self) -> None:
         assert not parse_name_khmer("SOK DARA").valid
+
+
+class TestIssueDate:
+    def test_takes_the_first_date_on_the_validity_line(self) -> None:
+        result = parse_issue("សុពលភាព: ០៥.០៣.២០២០ ដល់ថ្ងៃ ០៤.០៣.២០៣០")
+        assert result.value == "2020-03-05"
+        assert result.valid
+
+    def test_no_date_is_invalid(self) -> None:
+        assert not parse_issue("សុពលភាព:").valid
+
+
+class TestDocumentType:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("អត្តសញ្ញាណប័ណ្ណ", "national_id"),
+            ("អត្តសញ្ញាណប័ណ្ណសញ្ជាតិខ្មែរ", "national_id"),
+            ("NATIONAL IDENTITY CARD", "national_id"),
+            ("លិខិតឆ្លងដែន", "passport"),
+        ],
+    )
+    def test_maps_known_document_titles(self, raw: str, expected: str) -> None:
+        result = parse_document_type(raw)
+        assert result.value == expected
+        assert result.valid
+
+    def test_unknown_is_invalid(self) -> None:
+        assert not parse_document_type("random text").valid
+
+
+class TestNationality:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("ខ្មែរ", "Khmer"),
+            ("សញ្ជាតិ: ខ្មែរ", "Khmer"),
+            ("Khmer", "Khmer"),
+            ("Cambodian", "Cambodian"),
+        ],
+    )
+    def test_maps_known_nationalities(self, raw: str, expected: str) -> None:
+        result = parse_nationality(raw)
+        assert result.value == expected
+        assert result.valid
+
+    def test_unknown_is_invalid(self) -> None:
+        assert not parse_nationality("ចិន").valid
+
+
+class TestFreeText:
+    @pytest.mark.parametrize("raw", ["ភ្នំពេញ", "ភ្នំពេញ កម្ពុជា", "Phnom Penh", "អាសយដ្ឋាន: ភ្នំពេញ"])
+    def test_keeps_text_with_letters(self, raw: str) -> None:
+        result = parse_free_text(raw)
+        assert result.value == raw.rsplit(":", 1)[-1].strip()
+        assert result.valid
+
+    @pytest.mark.parametrize("raw", ["", "12345", "   "])
+    def test_rejects_text_without_letters(self, raw: str) -> None:
+        assert not parse_free_text(raw).valid

@@ -1,8 +1,13 @@
-"""Orchestrates one ID-card read: decode, quality gate, flatten, orient, recognize, parse, decide.
+"""Orchestrates one KYC read: decode, quality gate, flatten, OCR, extract, validate, face.
 
 Stateless per call: every intermediate image is a local variable, so concurrent requests
-cannot see each other's data. The only shared object is the recognizer, which must be
-thread-safe (see recognize.Recognizer).
+cannot see each other's data. The only shared objects are the OCR provider and the face
+detector, which must be thread-safe.
+
+Stage order (mirrors the documented pipeline):
+
+    Image -> QualityDetector -> DocumentDetector -> ImagePreprocessor
+          -> OCR -> FieldExtractor -> Validator -> KYCResult
 """
 
 import logging
@@ -13,114 +18,142 @@ from datetime import date
 import numpy as np
 
 from khmer_kyc_ocr.config import Settings
-from khmer_kyc_ocr.pipeline import parse
 from khmer_kyc_ocr.pipeline.decode import decode_image
-from khmer_kyc_ocr.pipeline.quality import sharpness, short_side
-from khmer_kyc_ocr.pipeline.recognize import Recognition, Recognizer
-from khmer_kyc_ocr.pipeline.template import TEMPLATE_V1, TEMPLATE_VERSION, crop
-from khmer_kyc_ocr.pipeline.warp import Image, find_card
-from khmer_kyc_ocr.schemas import FieldName, FieldResult, IdCardResult, RejectedImage
+from khmer_kyc_ocr.pipeline.document import DocumentDetector
+from khmer_kyc_ocr.pipeline.extract import FieldExtractor
+from khmer_kyc_ocr.pipeline.face import FaceDetector
+from khmer_kyc_ocr.pipeline.ocr import OCRProvider
+from khmer_kyc_ocr.pipeline.preprocess import improve_readability
+from khmer_kyc_ocr.pipeline.quality import QualityDetector
+from khmer_kyc_ocr.pipeline.validate import Validator
+from khmer_kyc_ocr.pipeline.warp import Image
+from khmer_kyc_ocr.schemas import FieldName, FieldResult, KYCResult, RejectedImage
 
 logger = logging.getLogger(__name__)
 
-PARSERS: dict[FieldName, Callable[[str], parse.Parsed]] = {
-    "id_number": parse.parse_id_number,
-    "name_khmer": parse.parse_name_khmer,
-    "name_latin": parse.parse_name_latin,
-    "date_of_birth": parse.parse_date,
-    "sex": parse.parse_sex,
-    "expiry_date": parse.parse_expiry,
-}
+# Below this many valid fields, the card is probably upside-down (or unreadable), so we
+# try the 180° flip. An upright ID card yields several valid fields; garbled upside-down
+# text rarely yields more than one accidental match.
+_MIN_VALID_FIELDS_FOR_ORIENTATION = 2
 
 
-class IdCardReader:
+class KYCPipeline:
+    """Runs the full document -> structured-KYC pipeline for one image."""
+
     def __init__(
         self,
-        recognizer: Recognizer,
+        ocr: OCRProvider,
         settings: Settings,
         *,
+        extractor: FieldExtractor | None = None,
+        face_detector: FaceDetector | None = None,
         today: Callable[[], date] = date.today,
     ) -> None:
-        self._recognizer = recognizer
+        self._ocr = ocr
         self._settings = settings
-        self._today = today
+        self._extractor = extractor or _default_extractor()
+        self._face = self._build_face_detector(face_detector)
+        self._validator = Validator(min_confidence=settings.min_confidence, today=today)
+        self._quality = QualityDetector(
+            min_short_side_px=settings.min_short_side_px,
+            min_sharpness=settings.min_sharpness,
+            min_brightness=settings.min_brightness,
+            max_glare_ratio=settings.max_glare_ratio,
+        )
+        self._document = DocumentDetector()
 
-    def read(self, data: bytes) -> IdCardResult | RejectedImage:
+    def _build_face_detector(self, injected: FaceDetector | None) -> FaceDetector | None:
+        if not self._settings.face_detection:
+            return None
+        # A test-injected detector wins; otherwise build the default offline YuNet detector.
+        return injected if injected is not None else FaceDetector()
+
+    def read(self, data: bytes) -> KYCResult | RejectedImage:
         started = time.perf_counter()
         outcome = self._read(data)
         # Log the outcome and timing only: never image bytes or field values (personal data).
         logger.info(
-            "id-card read outcome=%s ms=%.0f",
+            "kyc read outcome=%s ms=%.0f",
             outcome.reason if isinstance(outcome, RejectedImage) else "ok",
             (time.perf_counter() - started) * 1000,
         )
         return outcome
 
-    def _read(self, data: bytes) -> IdCardResult | RejectedImage:
+    def _read(self, data: bytes) -> KYCResult | RejectedImage:
         image = decode_image(data)
         if image is None:
             return RejectedImage(reason="undecodable", detail="Not a JPEG, PNG or WebP image.")
-        min_side = self._settings.min_short_side_px
-        if short_side(image) < min_side:
+
+        if min(image.shape[:2]) < self._settings.min_short_side_px:
+            min_side = self._settings.min_short_side_px
             return RejectedImage(
-                reason="too_small", detail=f"Photo must be at least {min_side}px on its short side."
+                reason="too_small",
+                detail=f"Photo must be at least {min_side}px on its short side.",
             )
-        card = find_card(image)
+
+        card = self._document.find_card(image)
         if card is None:
             return RejectedImage(
                 reason="card_not_found",
                 detail="Place the whole card inside the frame on a plain, darker background.",
             )
-        if sharpness(card) < self._settings.min_sharpness:
+
+        quality = self._quality.check(card)
+        if quality.is_blurry:
             return RejectedImage(
                 reason="blurry", detail="Hold the phone steady and retake the photo."
             )
+        if quality.is_glared:
+            return RejectedImage(reason="glare", detail="Move out of direct light to avoid glare.")
+        if quality.is_dark:
+            return RejectedImage(reason="dark", detail="The photo is too dark; add more light.")
 
-        card, id_reading = self._orient(card)
-        readings: dict[FieldName, Recognition] = {"id_number": id_reading}
-        for name, roi in TEMPLATE_V1.items():
-            if name != "id_number":
-                readings[name] = self._recognizer.read_line(crop(card, roi))
-        return self._decide(readings)
+        readable = improve_readability(card)
+        fields, reasons = self._read_oriented(readable)
 
-    def _orient(self, card: Image) -> tuple[Image, Recognition]:
-        """Pick upright vs 180°-flipped by which orientation yields a valid ID number.
+        face = self._face.detect(card) if self._face is not None else None
 
-        Costs one extra recognizer call per request; cheaper and more reliable than a
-        separate orientation classifier, because the ID number has a strict format.
-        """
-        roi = TEMPLATE_V1["id_number"]
-        upright = self._recognizer.read_line(crop(card, roi))
-        if parse.parse_id_number(upright.text).valid:
-            return card, upright
-        flipped_card: Image = np.ascontiguousarray(np.rot90(card, 2))
-        flipped = self._recognizer.read_line(crop(flipped_card, roi))
-        if parse.parse_id_number(flipped.text).valid or flipped.confidence > upright.confidence:
-            return flipped_card, flipped
-        return card, upright
-
-    def _decide(self, readings: dict[FieldName, Recognition]) -> IdCardResult:
-        fields: dict[FieldName, FieldResult] = {}
-        reasons: list[str] = []
-        for name, reading in readings.items():
-            parsed = PARSERS[name](reading.text)
-            confidence = min(max(reading.confidence, 0.0), 1.0)
-            fields[name] = FieldResult(
-                value=parsed.value, raw=reading.text, confidence=confidence, valid=parsed.valid
-            )
-            # Reasons name the field and the problem, never the value: they reach logs/tickets.
-            if not parsed.valid:
-                reasons.append(f"{name}: failed validation")
-            elif confidence < self._settings.min_confidence:
-                reasons.append(f"{name}: low confidence {confidence:.2f}")
-
-        expiry = fields["expiry_date"].value
-        if expiry is not None and date.fromisoformat(expiry) < self._today():
-            reasons.append("expiry_date: card expired")
-
-        return IdCardResult(
-            template_version=TEMPLATE_VERSION,
+        return KYCResult(
             fields=fields,
+            confidence={name: f.confidence for name, f in fields.items()},
+            face=face,
+            quality=quality,
+            ocr_engine=self._ocr.engine,
+            model_revision=self._ocr.model_revision,
             needs_review=bool(reasons),
             review_reasons=reasons,
         )
+
+    def _read_oriented(self, readable: Image) -> tuple[dict[FieldName, FieldResult], list[str]]:
+        """OCR + extract, resolving the 180° ambiguity with content.
+
+        A rectangle is 180°-symmetric, so geometry can't tell upright from upside-down.
+        We read the card, and if the result looks garbled (too few valid fields), we read
+        the 180°-flipped card and keep whichever orientation produced more valid fields.
+        """
+        fields, reasons = self._extract_and_validate(readable)
+        if self._valid_field_count(fields) >= _MIN_VALID_FIELDS_FOR_ORIENTATION:
+            return fields, reasons
+
+        flipped = np.ascontiguousarray(np.rot90(readable, 2))
+        flipped_fields, flipped_reasons = self._extract_and_validate(flipped)
+        if self._valid_field_count(flipped_fields) > self._valid_field_count(fields):
+            return flipped_fields, flipped_reasons
+        return fields, reasons
+
+    def _extract_and_validate(
+        self, readable: Image
+    ) -> tuple[dict[FieldName, FieldResult], list[str]]:
+        lines = self._ocr.read_lines(readable)
+        extracted = self._extractor.extract(lines)
+        return self._validator.validate(extracted)
+
+    @staticmethod
+    def _valid_field_count(fields: dict[FieldName, FieldResult]) -> int:
+        return sum(1 for f in fields.values() if f.valid)
+
+
+def _default_extractor() -> FieldExtractor:
+    from khmer_kyc_ocr.pipeline.extract import RuleBasedFieldExtractor
+
+    return RuleBasedFieldExtractor()

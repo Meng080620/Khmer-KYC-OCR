@@ -1,142 +1,85 @@
 # Khmer KYC OCR
 
-Offline, on-prem OCR for the front of the Cambodian national ID card. You send a photo and get back structured, validated fields with a per-field confidence, plus a `needs_review` flag for anything a human should check.
+A mobile application that scans Cambodian identity documents with the phone camera,
+extracts Khmer and English text with OCR, and returns structured KYC data with per-field
+confidence — plus a review screen where the user corrects anything uncertain before
+submitting.
 
 ```
-photo ─▶ decode (in memory) ─▶ size check ─▶ find + flatten card ─▶ blur check
-      ─▶ orient (upright vs 180°, decided by the ID-number format)
-      ─▶ crop fixed field boxes ─▶ Kiri OCR per box ─▶ parse + validate ─▶ review decision
+Camera  →  Document Detection  →  Auto Crop / Perspective  →  Quality Check
+        →  Khmer + English OCR  →  Field Extraction  →  Validation  →  KYC Result
 ```
 
-## Status: not production-ready yet
+> **OCR extraction is not identity verification.** This system reads what is printed on a
+> document and flags uncertain fields for human review. It does **not** confirm the document
+> is authentic or that the identity is verified — that is a separate, explicit step.
 
-- **Field boxes are uncalibrated.** `pipeline/template.py` approximates the card layout. Tune it on real cards with `spike/calibrate.py`. Every response carries `template_version`, which ends in `-uncalibrated` until that's done.
-- **Accuracy is unmeasured.** Run `spike/bench.py` on 30 or more real, labelled cards. The gate is an ID-number exact match of at least 95% and p95 latency under 1.5s on the target CPU.
-- **ID-number format is assumed.** `parse.ID_NUMBER_RE` expects 9 digits. Confirm against the sample set.
-- **Model is pinned to the 2026-01-30 Kiri weights.** The newer upload can't be loaded by any `kiri-ocr` release; see the comment on `MODEL_REVISION` in `pipeline/kiri.py`.
+## Repository layout
 
-## Why not PaddleOCR / Tesseract
+```
+src/khmer_kyc_ocr/        Python FastAPI OCR service (offline, on-prem)
+  pipeline/               the modular stages (see docs/ARCHITECTURE.md)
+  data/                   bundled YuNet face-detection model (offline)
+tests/                    backend tests (synthetic cards, fake + real OCR)
+spike/bench.py            go/no-go accuracy benchmark on real, consented photos
+mobile/                   Expo + TypeScript app (scanner, review, secure client)
+docs/                     ARCHITECTURE.md and TESTING.md
+```
 
-- **PaddleOCR** (PP-OCRv5) supports 106 languages, and Khmer is not one of them. `lang='kh'` does not exist.
-- **Tesseract** handles Khmer subscript stacking poorly.
-- **Kiri OCR** (Apache-2.0, ~23M params) is trained on Khmer and English text lines and runs on CPU.
-- **Why not a vision-language model:** it runs offline only if you host it, and it can hallucinate a plausible ID number. Recognition plus strict per-field validation fails loudly instead.
+## Backend
 
-## API
-
-`POST /v1/id-card` takes the raw image as the request body (`Content-Type: image/jpeg`, `image/png` or `image/webp`) and the header `X-API-Token`.
-
-It is deliberately not multipart. Starlette spools multipart files over 1 MB to a temp file, which would put ID images on disk and accept any upload size before the limit check. The raw body is read into memory with the limit enforced as bytes arrive.
-
-| Status | Meaning |
-|---|---|
-| 200 | `IdCardResult`: `fields.{id_number,name_khmer,name_latin,date_of_birth,sex,expiry_date}` each `{value, raw, confidence, valid}`, plus `needs_review` and `review_reasons` |
-| 401 | missing or wrong token (checked before the body is read) |
-| 413 | upload over `KYC_OCR_MAX_UPLOAD_BYTES` (default 5 MB) |
-| 415 | body is not a JPEG, PNG or WebP content type |
-| 422 | `{reason: undecodable \| too_small \| card_not_found \| blurry, detail}`: ask the user to retake the photo |
-
-`GET /healthz` needs no auth.
-
-Review reasons name the field and the problem, never the value. For example, `name_khmer: low confidence 0.62` or `expiry_date: card expired`.
-
-## Run
+Python 3.11+ (tested on 3.14). Offline OCR with Kiri OCR (Khmer + English), OpenCV for
+document detection, quality gates and face detection.
 
 ```bash
 python3.11 -m venv .venv && .venv/bin/pip install -e ".[dev,kiri]"
-```
-
-```bash
 .venv/bin/pip install --no-deps "kiri-ocr==0.2.15"
+KYC_OCR_API_TOKEN=change-me .venv/bin/uvicorn khmer_kyc_ocr.api:create_app --factory --host 0.0.0.0 --port 8000
 ```
 
-`--no-deps` is deliberate. The package's declared dependencies pull in `onnxruntime-gpu` (no macOS build), `datasets`, `matplotlib` and non-headless OpenCV, none of which recognition needs.
+### API
 
-```bash
-KYC_OCR_API_TOKEN=change-me .venv/bin/uvicorn khmer_kyc_ocr.api:create_app --factory --port 8000
-```
+| Endpoint | Description |
+|---|---|
+| `POST /v1/kyc` | JSON `{image_base64, content_type}` → `KYCResult` (mobile client) |
+| `POST /v1/id-card` | raw image bytes → `KYCResult` (server-to-server) |
+| `GET /healthz` | liveness, no auth |
 
-```bash
-curl -H "X-API-Token: change-me" -H "Content-Type: image/jpeg" --data-binary @card.jpg http://127.0.0.1:8000/v1/id-card
-```
+Both OCR endpoints require `X-API-Token`. A poor image returns `422` with a `reason`
+(`blurry`, `glare`, `dark`, `too_small`, `card_not_found`, `undecodable`).
 
-Docker (weights baked in, no network at runtime): see the header of the `Dockerfile`.
-
-| Env var | Default | |
-|---|---|---|
-| `KYC_OCR_API_TOKEN` | required | shared secret for the internal caller |
-| `KYC_OCR_MIN_CONFIDENCE` | 0.85 | below this, a field is flagged for review. **Must be calibrated.** Kiri scores clean, correct lines at about 0.44, so the default sends everything to review until `bench.py` gives a real value |
-| `KYC_OCR_MIN_SHARPNESS` | 60 | Laplacian variance on the flattened card; calibrate on real photos |
-| `KYC_OCR_MIN_SHORT_SIDE_PX` | 600 | |
-| `KYC_OCR_MAX_UPLOAD_BYTES` | 5242880 | |
-| `KYC_OCR_MAX_CONCURRENT_READS` | 2 | OCR calls in flight per worker; extra requests queue |
-
-## Test
+### Backend tests
 
 ```bash
 .venv/bin/pytest && .venv/bin/ruff check . && .venv/bin/mypy src tests spike
 ```
 
-`tests/test_kiri_integration.py` runs the real model through the full pipeline on a rendered, upside-down card. It skips when `kiri-ocr` or the cached weights are absent.
+## Mobile app
 
-The tests need neither torch nor real IDs:
-- Cards are synthetic.
-- The recognizer is a fake that reads a code painted into each field box.
-- `test_concurrent_requests_never_mix_results` checks that parallel requests each get back only their own ID.
-
-## Calibrate on real cards (required before launch)
-
-Use real front-of-card photos you have consent to use, taken the way users will take them: whole card in frame, darker plain background. They go in `spike/samples/`, which git ignores.
-
-**1. Add photos, then write the answer sheet.** This lists every photo in `labels.csv` with empty columns:
+Expo SDK 57 + TypeScript + Expo Router.
 
 ```bash
-mkdir -p spike/samples
+cd mobile
+npm install
+EXPO_PUBLIC_KYC_API_URL=http://<your-mac-lan-ip>:8000 npm start
 ```
 
-```bash
-.venv/bin/python spike/bench.py --init spike/samples/
-```
+- `EXPO_PUBLIC_KYC_API_URL` — OCR service URL (a device cannot use `127.0.0.1`).
+- `EXPO_PUBLIC_KYC_TOKEN` — dev fallback for the API token.
 
-**2. Fill in `labels.csv`** in the format the API returns:
-- ID number: 9 digits
-- names as printed, Latin name in uppercase
-- dates as `YYYY-MM-DD`
-- sex as `M` or `F`
+## Security
 
-**3. Tune the field boxes.** Run this on one card:
+Identity data is sensitive:
 
-```bash
-.venv/bin/python spike/calibrate.py spike/samples/card01.jpg /tmp/roi.png
-```
+- Images are decoded and processed **in memory**; never written to disk.
+- **No PII is logged** — review reasons name fields, never values.
+- Transport is HTTPS; the local provider is offline; token stored in `expo-secure-store`.
+- No third-party AI service is called by default (Cloud/AI providers are opt-in).
 
-Adjust `pipeline/template.py` until each red box covers its field on several cards. Then remove `-uncalibrated` from `TEMPLATE_VERSION`.
+## Status — MVP scope
 
-**4. Run the go/no-go benchmark:**
-
-```bash
-HF_HOME=.hf-cache .venv/bin/python spike/bench.py spike/samples/
-```
-
-- It passes if the ID number is exactly right on at least 95% of cards and p95 latency is under 1.5s.
-- Set `KYC_OCR_MIN_CONFIDENCE` just above the `wrong: p90` confidence it prints.
-- About 30 cards is the minimum for these numbers to mean anything.
-
-## Handling personal data
-
-- Images are decoded in memory and never written to disk.
-- Logs record the outcome and timing only.
-- Real sample images belong in `spike/samples/`, which is gitignored along with every image type.
-- The service must sit on an internal network behind the caller (for example Laravel). It is not an internet-facing endpoint.
-
-## Scaling
-
-- One CPU worker handles roughly 1–3 cards/s, since it makes 6–7 recognizer calls per card. Measure the real rate with `bench.py`.
-- To scale, raise `WORKERS` to match the core count (each worker holds its own model copy, about 300 MB), then add replicas behind a load balancer, then move to a GPU with batched field crops.
-- Callers should queue work (async jobs) rather than hold user requests open.
-
-## Out of scope for v1
-
-- Back of the card / MRZ
-- Face match against a selfie, and liveness checks
-- Client apps and backend integration
+In scope: Cambodian ID scanning → Khmer/English OCR → structured extraction → confidence →
+user review. Out of scope (by design): back-of-card/MRZ, selfie-to-ID face matching,
+liveness, document authenticity, banking/payment integrations. Accuracy must be measured
+on real photos with `spike/bench.py` (gate: ID exact ≥ 95%, p95 < 1.5 s). See
+docs/TESTING.md and docs/ARCHITECTURE.md.

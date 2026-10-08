@@ -5,9 +5,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .env
+.DS_Store
 
 # Real ID images are personal data: never commit them.
-data/
+/data/
 spike/samples/
 spike/*.csv
 *.jpg
@@ -15,4 +16,11 @@ spike/*.csv
 *.png
 *.webp
 !tests/fixtures/**
+# The bundled face-detection model and mobile app icons must stay tracked.
+!src/khmer_kyc_ocr/data/**
+!mobile/assets/**
 .hf-cache/
+
+# Node / Expo
+node_modules/
+.expo/

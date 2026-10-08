@@ -1,42 +1,68 @@
+import base64
+import binascii
 import hmac
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Any
 
 import anyio
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from khmer_kyc_ocr.config import Settings, get_settings
-from khmer_kyc_ocr.pipeline.template import TEMPLATE_VERSION
-from khmer_kyc_ocr.schemas import IdCardResult, RejectedImage
-from khmer_kyc_ocr.service import IdCardReader
+from khmer_kyc_ocr.pipeline.kiri import MODEL_REVISION
+from khmer_kyc_ocr.schemas import KYCResult, RejectedImage
+from khmer_kyc_ocr.service import KYCPipeline
 
 ACCEPTED_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 
 
-def create_app(reader: IdCardReader | None = None, settings: Settings | None = None) -> FastAPI:
-    """Build the app. Tests inject a reader with a fake recognizer; production loads Kiri once
-    per worker process at startup, so the first request doesn't pay the model-load cost."""
+class KYCRequest(BaseModel):
+    """Mobile-facing request body: the document image as base64.
+
+    Kept as JSON (not raw bytes) so the React Native client — where sending a raw binary
+    ``fetch`` body is unreliable across platforms — has a dependable transport. The image
+    is still decoded and processed entirely in memory; nothing touches disk.
+    """
+
+    image_base64: str
+    content_type: str = "image/jpeg"
+
+
+def build_ocr_provider(cfg: Settings) -> Any:
+    """Construct the OCR provider from settings. Local is the default and runs offline."""
+    if cfg.ocr_provider == "cloud":
+        from khmer_kyc_ocr.pipeline.ocr import CloudOCRProvider
+
+        if not cfg.cloud_url or cfg.cloud_token is None:
+            raise RuntimeError(
+                "ocr_provider=cloud requires KYC_OCR_CLOUD_URL and KYC_OCR_CLOUD_TOKEN"
+            )
+        return CloudOCRProvider(cfg.cloud_url, cfg.cloud_token.get_secret_value())
+
+    from khmer_kyc_ocr.pipeline.kiri import KiriRecognizer  # heavy: torch, imported lazily
+    from khmer_kyc_ocr.pipeline.ocr import LocalOCRProvider
+
+    return LocalOCRProvider(KiriRecognizer(), model_revision=MODEL_REVISION)
+
+
+def create_app(pipeline: KYCPipeline | None = None, settings: Settings | None = None) -> FastAPI:
+    """Build the app. Tests inject a pipeline with a fake OCR provider; production loads Kiri
+    once per worker process at startup, so the first request doesn't pay the model-load cost."""
     cfg = settings or get_settings()
-    state: dict[str, IdCardReader] = {}
+    state: dict[str, KYCPipeline] = {}
     # OCR is CPU-bound and torch already uses several threads per call; letting the default
     # 40-thread pool run 40 reads at once just thrashes the CPU and makes every request slow.
-    # Extra requests wait here instead, in arrival order.
     ocr_slots = anyio.CapacityLimiter(cfg.max_concurrent_reads)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        if reader is not None:
-            state["reader"] = reader
-        else:
-            from khmer_kyc_ocr.pipeline.kiri import KiriRecognizer  # heavy: torch
-
-            state["reader"] = IdCardReader(KiriRecognizer(), cfg)
+        state["pipeline"] = pipeline or KYCPipeline(build_ocr_provider(cfg), cfg)
         yield
         state.clear()
 
-    app = FastAPI(title="Khmer KYC OCR", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Khmer KYC OCR", version="0.2.0", lifespan=lifespan)
 
     def require_token(x_api_token: Annotated[str | None, Header()] = None) -> None:
         expected = cfg.api_token.get_secret_value()
@@ -46,7 +72,7 @@ def create_app(reader: IdCardReader | None = None, settings: Settings | None = N
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
-        return {"status": "ok" if "reader" in state else "loading", "template": TEMPLATE_VERSION}
+        return {"status": "ok" if "pipeline" in state else "loading"}
 
     async def read_limited_body(request: Request) -> bytes:
         """Read the raw image into memory, enforcing the size limit as bytes arrive.
@@ -60,13 +86,43 @@ def create_app(reader: IdCardReader | None = None, settings: Settings | None = N
         body = bytearray()
         async for chunk in request.stream():
             body += chunk
-            if len(body) > cfg.max_upload_bytes:  # Content-Length can lie or be absent
+            if len(body) > cfg.max_upload_bytes:
                 raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "Image too large")
         return bytes(body)
 
+    async def run(data: bytes) -> KYCResult | JSONResponse:
+        result = await anyio.to_thread.run_sync(state["pipeline"].read, data, limiter=ocr_slots)
+        if isinstance(result, RejectedImage):
+            return JSONResponse(status_code=422, content=result.model_dump())
+        return result
+
+    @app.post(
+        "/v1/kyc",
+        response_model=KYCResult,
+        dependencies=[Depends(require_token)],
+        responses={
+            401: {"description": "Bad token"},
+            413: {"description": "Upload too large"},
+            415: {"description": "Body is not a supported image type"},
+            422: {"model": RejectedImage, "description": "Photo unusable; ask for a retake"},
+        },
+    )
+    async def read_kyc(body: KYCRequest) -> KYCResult | JSONResponse:
+        if body.content_type.split(";")[0].strip().lower() not in ACCEPTED_TYPES:
+            raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "Unsupported image type")
+        try:
+            data = base64.b64decode(body.image_base64, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT, "image_base64 is not valid base64"
+            ) from None
+        if not data:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "image_base64 is empty")
+        return await run(data)
+
     @app.post(
         "/v1/id-card",
-        response_model=IdCardResult,
+        response_model=KYCResult,
         dependencies=[Depends(require_token)],  # runs before the body is read
         openapi_extra={
             "requestBody": {
@@ -85,14 +141,10 @@ def create_app(reader: IdCardReader | None = None, settings: Settings | None = N
     )
     async def read_id_card(
         request: Request, content_type: Annotated[str, Header()] = ""
-    ) -> IdCardResult | JSONResponse:
+    ) -> KYCResult | JSONResponse:
         if content_type.split(";")[0].strip().lower() not in ACCEPTED_TYPES:
             raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "Send the raw image bytes")
         data = await read_limited_body(request)
-        # OCR off the event loop: running it inline in `async def` would stall every request.
-        result = await anyio.to_thread.run_sync(state["reader"].read, data, limiter=ocr_slots)
-        if isinstance(result, RejectedImage):
-            return JSONResponse(status_code=422, content=result.model_dump())
-        return result
+        return await run(data)
 
     return app
