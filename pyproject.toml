@@ -55,5 +55,5 @@ mypy_path = "src"
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["cv2.*", "kiri_ocr.*", "httpx.*"]
+module = ["cv2.*", "kiri_ocr.*", "netra_ocr.*", "httpx.*"]
 ignore_missing_imports = true

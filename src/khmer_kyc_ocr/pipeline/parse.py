@@ -48,6 +48,24 @@ def _collapse_spaces(text: str) -> str:
     return " ".join(text.replace("\u200b", "").split())
 
 
+# Khmer vowel signs and other marks that attach to the consonant before them (U+17B6 to
+# U+17D3, and U+17DD). One with no consonant to sit on is a misreading: at the start of a
+# value it is usually what the recogniser made of the label's colon, and it shows on
+# screen as a dotted circle.
+_KHMER_MARK = "\u17b6-\u17d3\u17dd"
+_LEADING_JUNK = re.compile(rf"^[\s:៖។ៗ.,;·\-–—_|/\\◌{_KHMER_MARK}]+")
+_TRAILING_JUNK = re.compile(r"[\s:៖.,;·\-–—_|/\\◌]+$")
+_ORPHAN_MARK = re.compile(rf"(?<=\s)[{_KHMER_MARK}]+")
+
+
+def tidy_khmer(text: str) -> str:
+    """Khmer text without the stray marks and punctuation a recogniser leaves at its
+    edges, or a mark left hanging after a space."""
+    text = _ORPHAN_MARK.sub("", _collapse_spaces(text))
+    text = _TRAILING_JUNK.sub("", _LEADING_JUNK.sub("", text))
+    return _collapse_spaces(text)
+
+
 def parse_id_number(raw: str) -> Parsed:
     text = khmer_to_arabic_digits(_strip_label(raw)).translate(_DIGIT_LOOKALIKES)
     digits = re.sub(r"\D", "", text)
@@ -85,7 +103,7 @@ def parse_name_latin(raw: str) -> Parsed:
 
 
 def parse_name_khmer(raw: str) -> Parsed:
-    name = _collapse_spaces(_strip_label(raw))
+    name = tidy_khmer(_strip_label(raw))
     return Parsed(name, True) if _KHMER_NAME_RE.fullmatch(name) else _INVALID
 
 
@@ -139,7 +157,7 @@ def parse_nationality(raw: str) -> Parsed:
 
 def parse_free_text(raw: str) -> Parsed:
     """Address / place of birth: keep any line that has letters, cleaned of the label."""
-    text = _collapse_spaces(_strip_label(raw))
+    text = tidy_khmer(_strip_label(raw))
     if text and _TEXT_RE.search(text) and len(text) <= _MAX_TEXT_LEN:
         return Parsed(text, True)
     return _INVALID

@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # KYC_OCR_CLOUD_URL over HTTPS — disabled by default because it sends identity data
     # off-network; enabling it is an explicit privacy decision.
     ocr_provider: Literal["local", "cloud"] = "local"
+    # Which engine reads each text line when ocr_provider is "local": "kiri" (default) or
+    # "netra" (pip install netra-ocr; see pipeline/netra.py for what to weigh first).
+    recognizer: Literal["kiri", "netra"] = "kiri"
     cloud_url: str | None = None
     cloud_token: SecretStr | None = None
 

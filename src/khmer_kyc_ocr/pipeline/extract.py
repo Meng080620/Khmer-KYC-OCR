@@ -13,6 +13,7 @@ Only fields we actually observe are returned; the extractor never invents values
 
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Protocol
 
 from khmer_kyc_ocr.pipeline.ocr import OcrLine
@@ -59,12 +60,48 @@ class FieldExtractor(Protocol):
     def extract(self, lines: list[OcrLine]) -> dict[FieldName, ExtractedField]: ...
 
 
+# A label read with a character or two wrong is still that label. Short labels are only
+# matched exactly: three characters are too few to tell a near miss from another word.
+_FUZZY_MIN_LABEL = 6
+_FUZZY_RATIO = 0.72
+
+
+def _label_span(text: str, label: str) -> tuple[int, int] | None:
+    """Where ``label`` is in ``text``, allowing a recogniser's small misreadings."""
+    lower, wanted = text.lower(), label.lower()
+    exact = lower.find(wanted)
+    if exact >= 0:
+        return exact, exact + len(wanted)
+    if len(wanted) < _FUZZY_MIN_LABEL:
+        return None
+    best: tuple[float, int, int] | None = None
+    for size in range(len(wanted) - 2, len(wanted) + 3):
+        for start in range(max(0, len(lower) - size) + 1):
+            ratio = SequenceMatcher(None, lower[start : start + size], wanted).ratio()
+            if ratio >= _FUZZY_RATIO and (best is None or ratio > best[0]):
+                best = (ratio, start, start + size)
+    return None if best is None else (best[1], best[2])
+
+
+def _has_label(text: str, labels: tuple[str, ...] | list[str]) -> bool:
+    return any(_label_span(text, label) is not None for label in labels)
+
+
 def _strip_label(text: str, label: str) -> str:
-    idx = text.lower().find(label.lower())
-    if idx < 0:
+    span = _label_span(text, label)
+    if span is None:
         return text
-    rest = text[idx + len(label) :]
-    return rest.lstrip(" :៖").strip()
+    rest = text[span[1] :]
+    # A label matched loosely can stop a character or two short of its colon, and a
+    # recogniser sometimes reads the colon itself as a stray character.
+    colon = re.match(r"^.{0,3}?[:៖]", rest)
+    if colon is not None:
+        rest = rest[colon.end() :]
+    rest = rest.lstrip(" :៖").strip()
+    stray = re.match(r"^\S\s+(?=\S)", rest)
+    if stray is not None and text[span[0] : span[1]].lower() != label.lower():
+        rest = rest[stray.end() :]
+    return rest
 
 
 def _clean_digits(text: str) -> str:
@@ -105,15 +142,17 @@ class RuleBasedFieldExtractor:
 
     def _extract_dates(self, lines: list[OcrLine], found: dict[FieldName, ExtractedField]) -> None:
         for line in lines:
-            lower = line.text.lower()
-            if any(lbl in lower for lbl in _VALIDITY_LABELS) and "កំណើត" not in line.text:
+            if _has_label(line.text, _VALIDITY_LABELS) and not _has_label(line.text, _BIRTH_LABELS):
                 dates = _DATE_RE.findall(khmer_to_arabic_digits(line.text))
-                if dates:
+                # The line reads "from <date> until <date>". With only one of the two read
+                # there is no telling which it is, and calling it both would make a valid
+                # card look expired on the day it was issued.
+                if len(dates) >= 2:
                     found["issue_date"] = ExtractedField(line.text, dates[0], line.confidence)
                     found["expiry_date"] = ExtractedField(line.text, dates[-1], line.confidence)
                     break
         for line in lines:
-            if any(lbl in line.text.lower() for lbl in _BIRTH_LABELS):
+            if _has_label(line.text, _BIRTH_LABELS):
                 dates = _DATE_RE.findall(khmer_to_arabic_digits(line.text))
                 if dates:
                     found["date_of_birth"] = ExtractedField(line.text, dates[0], line.confidence)
@@ -137,15 +176,28 @@ class RuleBasedFieldExtractor:
         found: dict[FieldName, ExtractedField],
     ) -> None:
         for line in lines:
-            lower = line.text.lower()
             for label in labels:
-                if label in lower:
-                    value = _strip_label(line.text, label)
-                    if not value:
-                        value = self._next_line_value(line, lines)
-                    if value:
-                        found[field] = ExtractedField(value, value, line.confidence)
-                        return
+                if _label_span(line.text, label) is None:
+                    continue
+                value = _strip_label(line.text, label)
+                if not value:
+                    value = self._next_line_value(line, lines)
+                elif field == "address":
+                    value = f"{value} {self._continuation(line, lines)}".strip()
+                if value:
+                    found[field] = ExtractedField(value, value, line.confidence)
+                    return
+
+    def _continuation(self, line: OcrLine, lines: list[OcrLine]) -> str:
+        """The address runs on to a second line: the line right below, if it is plain text
+        with no label of its own."""
+        y, h = line.bbox[1], line.bbox[3]
+        below = [ln for ln in lines if y + h // 2 < ln.bbox[1] < y + h * 2]
+        if not below:
+            return ""
+        text = min(below, key=lambda ln: ln.bbox[1]).text.strip()
+        labelled = ":" in text or "៖" in text or "<" in text or re.search(r"\d", text)
+        return "" if labelled else text
 
     def _next_line_value(self, line: OcrLine, lines: list[OcrLine]) -> str:
         y, h = line.bbox[1], line.bbox[3]

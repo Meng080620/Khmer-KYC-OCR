@@ -84,10 +84,46 @@ class KYCResult(BaseModel):
     review_reasons: list[str] = Field(
         description="Human-readable reasons, naming fields but never field values"
     )
+    mrz: list[str] | None = Field(
+        default=None,
+        description="The card's three machine-readable lines (30 characters each), if read",
+    )
 
 
 class RejectedImage(BaseModel):
     """Returned with 422 when the photo is unusable, so the client can ask for a retake."""
 
-    reason: Literal["undecodable", "too_small", "blurry", "glare", "dark", "card_not_found"]
+    reason: Literal[
+        "undecodable", "too_small", "blurry", "glare", "dark", "card_not_found", "mrz_not_found"
+    ]
     detail: str
+
+
+# What a passport's machine-readable zone carries.
+PassportFieldName = Literal[
+    "document_number",
+    "surname",
+    "given_names",
+    "nationality",
+    "date_of_birth",
+    "gender",
+    "expiry_date",
+]
+
+
+class PassportResult(BaseModel):
+    """What was read from a passport's machine-readable zone.
+
+    Like ``KYCResult`` this is *reading only*: check digits show the zone was read
+    correctly, not that the passport is genuine.
+    """
+
+    fields: dict[PassportFieldName, FieldResult]
+    quality: QualityReport
+    ocr_engine: str = Field(description="Which OCR provider produced this result")
+    model_revision: str | None = Field(default=None, description="Pinned OCR weights, if any")
+    schema_version: str = Field(default="passport-td3-v1")
+    needs_review: bool = Field(description="True when any check digit disagrees")
+    review_reasons: list[str] = Field(
+        description="Human-readable reasons, naming fields but never field values"
+    )

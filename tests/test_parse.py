@@ -169,3 +169,32 @@ class TestFreeText:
     @pytest.mark.parametrize("raw", ["", "12345", "   "])
     def test_rejects_text_without_letters(self, raw: str) -> None:
         assert not parse_free_text(raw).valid
+
+
+@pytest.mark.parametrize(
+    ("raw", "clean"),
+    [
+        ("\u17c8 ភូមិរំដេញ ឃុំឈើទាល", "ភូមិរំដេញ ឃុំឈើទាល"),  # a mark the label's colon was read as
+        ("\u17c6ផូ លីហ៊ាង", "ផូ លីហ៊ាង"),  # a mark with no consonant under it
+        (": - ភ្នំពេញ កម្ពុជា .", "ភ្នំពេញ កម្ពុជា"),
+        ("សុខ \u17b6ដារា", "សុខ ដារា"),  # a mark left hanging after a space
+        ("ភ្នំពេញ\u200b កម្ពុជា", "ភ្នំពេញ កម្ពុជា"),
+        ("សុខ ដារា", "សុខ ដារា"),  # clean text is left alone, marks inside words included
+    ],
+)
+def test_khmer_text_is_tidied_of_stray_marks_and_punctuation(raw: str, clean: str) -> None:
+    from khmer_kyc_ocr.pipeline.parse import tidy_khmer
+
+    assert tidy_khmer(raw) == clean
+
+
+def test_a_khmer_name_with_a_stray_leading_mark_is_still_a_name() -> None:
+    from khmer_kyc_ocr.pipeline.parse import Parsed, parse_name_khmer
+
+    assert parse_name_khmer("\u17c6ផូ លីហ៊ាង") == Parsed("ផូ លីហ៊ាង", True)
+
+
+def test_an_address_loses_the_mark_the_colon_was_read_as() -> None:
+    from khmer_kyc_ocr.pipeline.parse import parse_free_text
+
+    assert parse_free_text("\u17c8 ភូមិរំដេញ ឃុំឈើទាល").value == "ភូមិរំដេញ ឃុំឈើទាល"

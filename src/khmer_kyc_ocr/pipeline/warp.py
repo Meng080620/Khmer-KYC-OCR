@@ -12,6 +12,17 @@ CARD_W, CARD_H = 1000, 631
 # the client should ask for a closer photo instead of us guessing.
 MIN_AREA_FRACTION = 0.15
 
+# Where the caller says the card is: (x, y, width, height) as fractions of the photo,
+# from the guide frame the person lined the card up in.
+Frame = tuple[float, float, float, float]
+# How far outside the guide frame to look for the card's edges: people overshoot a little.
+_FRAME_MARGIN = 0.12
+# A quad found inside the frame only counts as the card if it is card-shaped and fills
+# most of the frame. Otherwise it is the portrait box or a block of text, not the card.
+_CARD_RATIO = CARD_W / CARD_H
+_RATIO_TOLERANCE = 0.25
+_MIN_FRAME_FILL = 0.5
+
 
 def _order_corners(pts: NDArray[np.float32]) -> NDArray[np.float32]:
     """Return corners clockwise from top-left, with the long edge first so output is landscape."""
@@ -46,6 +57,70 @@ def _largest_quad(image: Image) -> NDArray[np.float32] | None:
     return None
 
 
+def _flatten(image: Image, quad: NDArray[np.float32]) -> Image:
+    target = np.array(
+        [[0, 0], [CARD_W - 1, 0], [CARD_W - 1, CARD_H - 1], [0, CARD_H - 1]], dtype=np.float32
+    )
+    matrix = cv2.getPerspectiveTransform(_order_corners(quad), target)
+    card = cv2.warpPerspective(image, matrix, (CARD_W, CARD_H), flags=cv2.INTER_CUBIC)
+    return np.asarray(card, dtype=np.uint8)  # no copy: already uint8, this only narrows the type
+
+
+def _frame_box(image: Image, frame: Frame, margin: float) -> tuple[int, int, int, int] | None:
+    """The frame in pixels, grown by ``margin`` and kept inside the photo. None if degenerate."""
+    height, width = image.shape[:2]
+    x, y, w, h = frame
+    left, right = (x - w * margin) * width, (x + w * (1 + margin)) * width
+    top, bottom = (y - h * margin) * height, (y + h * (1 + margin)) * height
+    x0, x1 = max(0, round(left)), min(width, round(right))
+    y0, y1 = max(0, round(top)), min(height, round(bottom))
+    return None if x1 - x0 < 2 or y1 - y0 < 2 else (x0, y0, x1, y1)
+
+
+def frame_region(image: Image, frame: Frame) -> Image:
+    """The framed part of the photo, with the usual margin around it. The whole photo if
+    the frame is degenerate."""
+    box = _frame_box(image, frame, _FRAME_MARGIN)
+    if box is None:
+        return image
+    x0, y0, x1, y1 = box
+    return np.ascontiguousarray(image[y0:y1, x0:x1])
+
+
+def _looks_like_the_framed_card(quad: NDArray[np.float32], frame_area: float) -> bool:
+    (_, (side_a, side_b), _) = cv2.minAreaRect(quad)
+    short, long = sorted((float(side_a), float(side_b)))
+    if short <= 0:
+        return False
+    card_shaped = abs(long / short - _CARD_RATIO) <= _CARD_RATIO * _RATIO_TOLERANCE
+    return card_shaped and float(cv2.contourArea(quad)) >= _MIN_FRAME_FILL * frame_area
+
+
+def find_card_in_frame(image: Image, frame: Frame) -> Image | None:
+    """The card from where the caller's guide frame says it is, for when its edges can't be
+    found in the whole photo (a light card on a light table has no edge to find).
+
+    First look for the edges again in just the framed part, where the card is the main
+    thing in view; that still corrects tilt and perspective. Failing that, take the frame
+    itself as the card: the person lined it up there, and reading a slightly loose crop
+    beats refusing the photo.
+    """
+    exact = _frame_box(image, frame, 0.0)
+    loose = _frame_box(image, frame, _FRAME_MARGIN)
+    if exact is None or loose is None:
+        return None
+    ex0, ey0, ex1, ey1 = exact
+    lx0, ly0, lx1, ly1 = loose
+
+    region = image[ly0:ly1, lx0:lx1]
+    quad = _largest_quad(region)
+    if quad is not None and _looks_like_the_framed_card(quad, (ex1 - ex0) * (ey1 - ey0)):
+        return _flatten(np.ascontiguousarray(region), quad)
+
+    corners = np.array([[ex0, ey0], [ex1, ey0], [ex1, ey1], [ex0, ey1]], dtype=np.float32)
+    return _flatten(image, corners)
+
+
 def find_card(image: Image) -> Image | None:
     """Flattened CARD_W x CARD_H card, upright or rotated 180°, or None if no card is found.
 
@@ -53,11 +128,4 @@ def find_card(image: Image) -> Image | None:
     the caller resolves that with content (see service.py).
     """
     quad = _largest_quad(image)
-    if quad is None:
-        return None
-    target = np.array(
-        [[0, 0], [CARD_W - 1, 0], [CARD_W - 1, CARD_H - 1], [0, CARD_H - 1]], dtype=np.float32
-    )
-    matrix = cv2.getPerspectiveTransform(_order_corners(quad), target)
-    card = cv2.warpPerspective(image, matrix, (CARD_W, CARD_H), flags=cv2.INTER_CUBIC)
-    return np.asarray(card, dtype=np.uint8)  # no copy: already uint8, this only narrows the type
+    return None if quad is None else _flatten(image, quad)
