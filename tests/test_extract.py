@@ -84,3 +84,33 @@ def test_layout_agnostic_does_not_care_about_order() -> None:
     assert result["date_of_birth"] == "01.02.1990"
     assert result["name_en"] == "SOK DARA"
     assert result["address"] == "ភ្នំពេញ"
+
+
+def _piece(text: str, x: int, y: int, w: int, confidence: float = 0.97) -> OcrLine:
+    return OcrLine(text=text, bbox=(x, y, w, 42), confidence=confidence)
+
+
+def test_label_and_value_read_as_two_pieces_of_one_line_stay_together() -> None:
+    # The projection line finder cuts a printed line at a wide space between words, as it
+    # does in DejaVu Sans: the label's value is beside it, not on the line below.
+    lines = [
+        _piece("Surname:", 58, 272, 198),
+        _piece("SOK DARA", 264, 272, 215),
+        _piece("Date of Birth:", 59, 381, 272),
+        _piece("01.02.1990", 339, 381, 232, confidence=0.43),
+        _piece("Validity:", 56, 490, 170),
+        _piece("05.03.2020 - 04.03.2030", 233, 490, 498),
+    ]
+    found = RuleBasedFieldExtractor().extract(lines)
+    assert found["name_en"].value == "SOK DARA"
+    assert found["date_of_birth"].value == "01.02.1990"
+    assert found["date_of_birth"].confidence == 0.43  # as sure as its least sure piece
+    assert found["issue_date"].value == "05.03.2020"
+    assert found["expiry_date"].value == "04.03.2030"
+
+
+def test_text_far_along_the_same_row_is_not_joined_on() -> None:
+    lines = [_piece("ភេទ: ប្រុស", 10, 100, 160), _piece("010845612", 700, 100, 230)]
+    result = _extract(lines)
+    assert result["gender"] == "ប្រុស"
+    assert result["id_number"] == "010845612"

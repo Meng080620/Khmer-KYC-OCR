@@ -104,6 +104,75 @@ def _strip_label(text: str, label: str) -> str:
     return rest
 
 
+# Two pieces are one printed line when they overlap for most of their height and the gap
+# between them is less than a character or two wide: the rule the Netra provider joins its
+# detector's boxes by, so its lines come here already whole.
+_SAME_LINE_OVERLAP = 0.6
+_MAX_GAP_IN_HEIGHTS = 1.2
+
+
+def _box(pieces: list[OcrLine]) -> tuple[int, int, int, int]:
+    """(x1, y1, x2, y2) around every piece."""
+    return (
+        min(piece.bbox[0] for piece in pieces),
+        min(piece.bbox[1] for piece in pieces),
+        max(piece.bbox[0] + piece.bbox[2] for piece in pieces),
+        max(piece.bbox[1] + piece.bbox[3] for piece in pieces),
+    )
+
+
+def _one_printed_line(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    overlap = min(a[3], b[3]) - max(a[1], b[1])
+    shorter = min(a[3] - a[1], b[3] - b[1])
+    gap = max(a[0], b[0]) - min(a[2], b[2])
+    return overlap > shorter * _SAME_LINE_OVERLAP and gap < shorter * _MAX_GAP_IN_HEIGHTS
+
+
+def _middle_then_left(pieces: list[OcrLine]) -> tuple[float, int]:
+    x1, y1, _, y2 = _box(pieces)
+    return (y1 + y2) / 2, x1
+
+
+def _as_one_line(pieces: list[OcrLine]) -> OcrLine:
+    if len(pieces) == 1:
+        return pieces[0]
+    pieces = sorted(pieces, key=lambda piece: piece.bbox[0])
+    x1, y1, x2, y2 = _box(pieces)
+    return OcrLine(
+        text=" ".join(piece.text for piece in pieces),
+        bbox=(x1, y1, x2 - x1, y2 - y1),
+        confidence=min(piece.confidence for piece in pieces),
+        det_confidence=min(piece.det_confidence for piece in pieces),
+        line_number=pieces[0].line_number,
+    )
+
+
+def _join_pieces_of_a_line(lines: list[OcrLine]) -> list[OcrLine]:
+    """Lines that are pieces of one printed line, joined into one and read left to right.
+
+    A line finder can cut a printed line where the font leaves a wide space between two
+    words: the projection finder does, so in some fonts "Surname:" and "SOK DARA" come
+    back as two lines. Apart, the label has nothing after it and the line below would be
+    taken as its value, and a date is no longer on the line that says what date it is.
+    """
+    groups = [[line] for line in lines]
+    # Until nothing joins any more: a value grows as its own pieces join, and only then
+    # reaches back to its label.
+    while True:
+        joined: list[list[OcrLine]] = []
+        for group in sorted(groups, key=_middle_then_left):
+            for line in joined:
+                if _one_printed_line(_box(line), _box(group)):
+                    line.extend(group)
+                    break
+            else:
+                joined.append(group)
+        if len(joined) == len(groups):
+            break
+        groups = joined
+    return [_as_one_line(pieces) for pieces in joined]
+
+
 def _clean_digits(text: str) -> str:
     return khmer_to_arabic_digits(text).translate(_DIGIT_LOOKALIKES)
 
@@ -120,7 +189,7 @@ def _normalise_id(text: str) -> str | None:
 
 class RuleBasedFieldExtractor:
     def extract(self, lines: list[OcrLine]) -> dict[FieldName, ExtractedField]:
-        ordered = sorted(lines, key=lambda ln: (ln.bbox[1], ln.bbox[0]))
+        ordered = sorted(_join_pieces_of_a_line(lines), key=lambda ln: (ln.bbox[1], ln.bbox[0]))
         found: dict[FieldName, ExtractedField] = {}
 
         self._extract_id_number(ordered, found)
